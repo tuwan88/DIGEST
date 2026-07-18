@@ -90,11 +90,3 @@ bash scripts/Overall_Performance/ogbg-molhiv/partialdiff_refine.sh
 bash scripts/Overall_Performance/ogbg-molhiv/app_bmao_k100.sh
 ```
 
-The scripts accept environment overrides such as `CUDA_DEVICE`, `WORKERS`,
-`DATALOADER_WORKERS`, and `MAX_TEST_PAIRS`. Outputs are written to `results/`.
-
-## Notes on anonymization
-
-This package is a clean export created for double-blind review. It does not
-include Git history, experiment outputs, local machine paths, datasets, or
-checkpoints. Third-party source retains only notices needed for its own use.
