@@ -1,0 +1,16 @@
+# Generated Python files
+__pycache__/
+*.py[cod]
+
+# External artifacts: do not commit datasets or checkpoints
+artifacts/**
+!artifacts/.gitkeep
+
+# Generated experiment outputs
+results/**
+!results/.gitkeep
+
+# Build products
+third_party/App-BMao-tlimited_main_table/ged
+third_party/App-BMao-tlimited_main_table/.obj/
+third_party/lib/libittnotify_stub.so
