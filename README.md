@@ -13,11 +13,7 @@ conda activate partialged
 
 ## Data
 
-Datasets and checkpoints under `artifacts/`. Check the required evaluation files with:
-
-```bash
-python scripts/Overall_Performance/check_required_artifacts.py
-```
+Datasets and checkpoints under `artifacts/`.
 
 ## Training
 
