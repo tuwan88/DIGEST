@@ -13,7 +13,7 @@ conda activate partialged
 
 ## Data
 
-Datasets and checkpoints under `artifacts/`.
+Datasets
 
 ## Training
 
