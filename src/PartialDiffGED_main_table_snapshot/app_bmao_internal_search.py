@@ -57,6 +57,17 @@ def _build_batched_candidate_cols(score_batch, col_mask, candidate_cap):
     return cols
 
 
+def _require_full_row_maps(row_maps, n1, n2):
+    """The incumbent must remain valid even if no search branch survives."""
+    rows = torch.arange(row_maps.shape[1], device=row_maps.device).view(1, -1)
+    valid_rows = rows < n1.view(-1, 1)
+    valid_targets = (row_maps >= 0) & (row_maps < n2.view(-1, 1))
+    ordered = row_maps.masked_fill(~valid_rows, torch.iinfo(row_maps.dtype).max).sort(dim=1).values
+    duplicates = (ordered[:, 1:] == ordered[:, :-1]) & (rows[:, 1:] < n1.view(-1, 1))
+    valid = ((~valid_rows) | valid_targets).all() & (~duplicates.any())
+    torch._assert_async(valid, 'Refine requires an injective full baseline matching.')
+
+
 def _matched_probabilities_from_dense_matching(final_matching, final_probabilities, device):
     work_device = final_probabilities.device
     final_matching = final_matching[: final_probabilities.shape[0], : final_probabilities.shape[1]].to(device=work_device)
@@ -153,10 +164,9 @@ def _compute_anchor_action_cost_cache(anchor_targets, anchor_mask, ged_adj1_batc
     device = anchor_targets.device
     num_contexts, max_n1 = anchor_targets.shape
     max_n2 = int(ged_adj2_batch.shape[1])
-    anchor_delete_cost = torch.zeros((num_contexts, max_n1), dtype=torch.float32, device=device)
     anchor_edge_cost = torch.zeros((num_contexts, max_n1, max_n2), dtype=torch.float32, device=device)
     if num_contexts == 0 or max_n1 == 0:
-        return anchor_edge_cost, anchor_delete_cost
+        return anchor_edge_cost, None
 
     adj1 = ged_adj1_batch > 0.5
     adj2 = ged_adj2_batch > 0.5
@@ -164,13 +174,12 @@ def _compute_anchor_action_cost_cache(anchor_targets, anchor_mask, ged_adj1_batc
     for anchor_row in range(max_n1):
         valid = anchor_mask[:, anchor_row].to(dtype=torch.float32)
         q_edges = adj1[:, :, anchor_row]
-        anchor_delete_cost.add_(q_edges.to(dtype=torch.float32) * valid.view(-1, 1))
         if max_n2 > 0:
             anchor_cols = anchor_targets[:, anchor_row].clamp(min=0, max=max_n2 - 1)
             g_edges = adj2[batch_idx, :, anchor_cols]
             diff = q_edges.unsqueeze(2) ^ g_edges.unsqueeze(1)
             anchor_edge_cost.add_(diff.to(dtype=torch.float32) * valid.view(-1, 1, 1))
-    return anchor_edge_cost, anchor_delete_cost
+    return anchor_edge_cost, None
 
 
 def _score_compact_row_maps_exact(
@@ -241,18 +250,8 @@ def _compute_gpu_refine_immediate_costs(
 
     if ged_adj1_batch.dtype == torch.bool or ged_adj2_batch.dtype == torch.bool:
         aq_cur_bool = ged_adj1_batch[pair_flat, current_rows_flat, :].to(dtype=torch.bool)
-        delete_edge_cost = (aq_cur_bool & matched_bool_for_edges).sum(dim=1).to(dtype=torch.float32).view(num_contexts, beam_width)
     else:
         aq_cur = ged_adj1_batch[pair_flat, current_rows_flat, :].to(dtype=torch.float32)
-        delete_edge_cost = (aq_cur * matched_flat).sum(dim=1).view(num_contexts, beam_width)
-    if anchor_delete_cost_batch is not None:
-        delete_edge_cost = delete_edge_cost + anchor_delete_cost_batch[pair_flat, current_rows_flat].view(num_contexts, beam_width)
-    delete_mask = action_cols == max_n2
-    immediate_cost = torch.where(
-        delete_mask & valid_parent.unsqueeze(-1),
-        delete_edge_cost.unsqueeze(-1) + float(runner.unmatched_cost),
-        immediate_cost,
-    )
     if max_n2 == 0:
         return immediate_cost
 
@@ -288,7 +287,7 @@ def _compute_gpu_refine_immediate_costs(
         edge_cost = edge_cost + anchor_edge.view(num_contexts, beam_width, action_count)
 
     chosen_real = (action_cols >= 0) & (action_cols < max_n2)
-    return torch.where(chosen_real, node_selected + edge_cost, immediate_cost)
+    return torch.where(chosen_real & valid_parent.unsqueeze(-1), node_selected + edge_cost, immediate_cost)
 
 
 def _compute_gpu_refine_row_col_lb(
@@ -317,7 +316,7 @@ def _compute_gpu_refine_row_col_lb(
     available_cols = col_mask.index_select(0, pair_idx) & (~used_cols)
     available_cost = node_cost.masked_fill(~available_cols.unsqueeze(1), inf)
 
-    row_free = row_mask.index_select(0, pair_idx) & (row_maps < -1)
+    row_free = row_mask.index_select(0, pair_idx) & (row_maps < 0)
     row_remaining = row_free.clone()
     row_remaining[torch.arange(num_states, device=device), current_rows] = False
     if os.environ.get('PARTIALDIFF_ROW_ONLY_LB', '0') == '1':
@@ -395,6 +394,10 @@ def _greedy_complete_row_maps_from_score(
         return row_maps
     batch_n1 = n1.index_select(0, pair_idx)
     batch_n2 = n2.index_select(0, pair_idx)
+    # Even nonfinite scores must leave legal targets available to completion.
+    completion_score = torch.nan_to_num(completion_score, nan=torch.finfo(completion_score.dtype).min)
+    completion_score = completion_score.masked_fill(
+        col_ids.view(1, 1, -1) >= batch_n2.view(-1, 1, 1), float('-inf'))
     if runner.assignment_backend == 'row_top1_unique_n2':
         return runner._complete_row_maps_row_top1_unique(
             completion_score,
@@ -403,18 +406,12 @@ def _greedy_complete_row_maps_from_score(
             batch_n2,
         )
 
-    partial, matched_mask, blocked_rows = runner._build_partial_from_row_mapping(row_maps, max_n2)
-    selected = partial > 0.5
-    col_taken = selected.any(dim=1)
-    remaining_rows = ((~matched_mask) & (~blocked_rows) & (row_ids.view(1, -1) < batch_n1.view(-1, 1))).sum(dim=1).long()
-    remaining_cols = ((~col_taken) & (col_ids.view(1, -1) < batch_n2.view(-1, 1))).sum(dim=1).long()
-    matched_count = matched_mask.sum(dim=1).long()
-    full_sizes = matched_count + torch.minimum(remaining_rows, remaining_cols)
+    partial, _, _ = runner._build_partial_from_row_mapping(row_maps, max_n2)
     completed = runner._complete_partial_matchings_greedy(
         completion_score,
         partial,
-        blocked_rows | (row_ids.view(1, -1) >= batch_n1.view(-1, 1)),
-        full_sizes,
+        row_ids.view(1, -1) >= batch_n1.view(-1, 1),
+        batch_n1,
     )
     return runner._dense_matchings_to_row_maps(completed > 0.5, batch_n1)
 
@@ -482,6 +479,8 @@ def _run_gpu_refine_search(runner, contexts, variant_name, completion_mode):
 
     device = runner.trainer.device
     num_contexts = len(contexts)
+    if any(context.n1 > context.n2 for context in contexts):
+        raise ValueError('Full-matching refine requires n1 <= n2. Orient graph pairs before diffusion.')
     max_n1 = max(context.n1 for context in contexts)
     max_n2 = max(context.n2 for context in contexts)
     feat_dim = int(runner.trainer.features[0].shape[-1])
@@ -498,7 +497,8 @@ def _run_gpu_refine_search(runner, contexts, variant_name, completion_mode):
     step_limit = max_n1 if max_search_depth <= 0 else min(max_n1, max_search_depth)
     refine_diagnostics_enable = bool(getattr(runner.trainer.args, 'app_bmao_refine_diagnostics_enable', False))
     fast_exact_update_enable = bool(getattr(runner.trainer.args, 'app_bmao_fast_exact_update', False))
-    action_count = candidate_cap + 1
+    # Every source node receives a real target; no dummy/delete action.
+    action_count = candidate_cap
     top_r = min(branch_width, action_count)
     pool_size = min(max(beam_width, rerank_pool), beam_width * top_r)
     final_chunk_size = max(1, num_contexts * pool_size)
@@ -580,6 +580,7 @@ def _run_gpu_refine_search(runner, contexts, variant_name, completion_mode):
             label2_batch[idx, :context.n2] = context.target_labels_t[:context.n2].to(device=device, dtype=torch.long)
         else:
             label2_batch[idx, :context.n2] = runner.trainer._node_labels_dense(context.x2).to(device=device, dtype=torch.long)[:context.n2]
+    _require_full_row_maps(best_row_maps, n1, n2)
     node_cost_batch = (label1_batch.unsqueeze(2) != label2_batch.unsqueeze(1)).to(dtype=torch.float32)
     left_upper_batch = torch.triu(ged_adj1_batch > 0.5, diagonal=1)
     left_edge_count_batch = left_upper_batch.sum(dim=(1, 2)).to(dtype=torch.float)
@@ -635,7 +636,6 @@ def _run_gpu_refine_search(runner, contexts, variant_name, completion_mode):
             used_cols[state_idx, beam_idx, row_mapping[state_idx, beam_idx, row_idx]] = True
 
     pair_flat_full = torch.arange(num_contexts, device=device).view(-1, 1).expand(num_contexts, beam_width).reshape(-1)
-    action_cols = torch.empty((num_contexts, beam_width, action_count), dtype=torch.long, device=device)
     action_valid = torch.empty((num_contexts, beam_width, action_count), dtype=torch.bool, device=device)
     action_lb = torch.empty((num_contexts, beam_width, action_count), dtype=torch.float32, device=device)
     rerank_score = torch.empty((num_contexts, pool_size), dtype=torch.float32, device=device)
@@ -648,8 +648,7 @@ def _run_gpu_refine_search(runner, contexts, variant_name, completion_mode):
         current_rows = row_order.gather(1, depth.clamp(max=max(max_n1 - 1, 0)))
         gather_rows = current_rows.unsqueeze(-1).expand(-1, -1, candidate_cap)
         action_cols_real = candidate_cols.gather(1, gather_rows)
-        action_cols[:, :, :candidate_cap] = action_cols_real
-        action_cols[:, :, candidate_cap] = max_n2
+        action_cols = action_cols_real
 
         action_immediate_start = runner._profile_start()
         action_immediate = _compute_gpu_refine_immediate_costs(
@@ -668,14 +667,13 @@ def _run_gpu_refine_search(runner, contexts, variant_name, completion_mode):
         )
         runner._profile_stop(action_immediate_start, 'search.action_cost')
 
-        action_valid.zero_()
         real_valid = action_cols_real >= 0
         if max_n2 > 0:
             safe_real_cols = action_cols_real.clamp(min=0, max=max_n2 - 1)
             real_valid = real_valid & (~used_cols.gather(2, safe_real_cols))
             real_valid = real_valid & (safe_real_cols < n2.view(-1, 1, 1))
-        action_valid[:, :, :candidate_cap] = real_valid & valid_parent.unsqueeze(-1)
-        action_valid[:, :, candidate_cap] = valid_parent
+        # Exhausted candidates stop this branch; retain the full incumbent.
+        torch.logical_and(real_valid, valid_parent.unsqueeze(-1), out=action_valid)
 
         child_g = current_cost.unsqueeze(-1) + action_immediate.masked_fill(~action_valid, float('inf'))
 
@@ -742,20 +740,12 @@ def _run_gpu_refine_search(runner, contexts, variant_name, completion_mode):
         pool_lb = top_action_lb.reshape(num_contexts, -1).gather(1, pool_idx)
         pool_rows = current_rows.gather(1, pool_parent)
 
-        pool_maps = row_mapping.gather(1, pool_parent.unsqueeze(-1).expand(-1, -1, max_n1)).clone()
-        pool_real_cols = torch.where(pool_cols == max_n2, torch.full_like(pool_cols, -1), pool_cols)
+        pool_maps = row_mapping.gather(1, pool_parent.unsqueeze(-1).expand(-1, -1, max_n1))
         valid_pool_materialize = pool_active & (pool_rows >= 0) & (pool_rows < max_n1)
         safe_pool_rows = pool_rows.clamp(min=0, max=max(max_n1 - 1, 0)).unsqueeze(-1)
         pool_old_val = pool_maps.gather(2, safe_pool_rows)
-        pool_src_val = torch.where(valid_pool_materialize.unsqueeze(-1), pool_real_cols.unsqueeze(-1), pool_old_val)
+        pool_src_val = torch.where(valid_pool_materialize.unsqueeze(-1), pool_cols.unsqueeze(-1), pool_old_val)
         pool_maps.scatter_(2, safe_pool_rows, pool_src_val)
-        pool_used_cols = used_cols.gather(1, pool_parent.unsqueeze(-1).expand(-1, -1, max_n2)).clone()
-        if max_n2 > 0:
-            pool_real_assign = pool_active & (pool_cols >= 0) & (pool_cols < max_n2)
-            safe_pool_cols = pool_cols.clamp(min=0, max=max_n2 - 1).unsqueeze(-1)
-            pool_old_used = pool_used_cols.gather(2, safe_pool_cols)
-            pool_src_used = pool_old_used | pool_real_assign.unsqueeze(-1)
-            pool_used_cols.scatter_(2, safe_pool_cols, pool_src_used)
 
         flat_pool_pair, flat_pool_slot = torch.nonzero(pool_active, as_tuple=True)
         if flat_pool_pair.numel() == 0:
@@ -869,7 +859,14 @@ def _run_gpu_refine_search(runner, contexts, variant_name, completion_mode):
         new_active = torch.isfinite(keep_score)
         keep_parent = pool_parent.gather(1, keep_pool_idx)
         next_row_mapping = pool_maps.gather(1, keep_pool_idx.unsqueeze(-1).expand(-1, -1, max_n1))
-        next_used_cols = pool_used_cols.gather(1, keep_pool_idx.unsqueeze(-1).expand(-1, -1, max_n2))
+        # Only surviving beam states need a materialized occupancy tensor.
+        next_used_cols = used_cols.gather(1, keep_parent.unsqueeze(-1).expand(-1, -1, max_n2))
+        if max_n2 > 0:
+            keep_cols = pool_cols.gather(1, keep_pool_idx)
+            keep_real = pool_active.gather(1, keep_pool_idx) & (keep_cols >= 0) & (keep_cols < max_n2)
+            safe_keep_cols = keep_cols.clamp(min=0, max=max_n2 - 1).unsqueeze(-1)
+            old_used = next_used_cols.gather(2, safe_keep_cols)
+            next_used_cols.scatter_(2, safe_keep_cols, old_used | keep_real.unsqueeze(-1))
         next_current_cost = pool_g.gather(1, keep_pool_idx)
         next_depth = depth.gather(1, keep_parent) + new_active.long()
 
@@ -1662,7 +1659,8 @@ class InternalAppBmaoSearchRunner:
         if max_n2 > 0 and bool(matched_mask.any()):
             state_idx, row_idx = torch.nonzero(matched_mask, as_tuple=True)
             partial[state_idx, row_idx, row_mapping[state_idx, row_idx]] = 1.0
-        blocked_rows = row_mapping == -1
+        # Negative entries are undecided (or padding), never committed deletes.
+        blocked_rows = torch.zeros_like(matched_mask)
         return partial, matched_mask, blocked_rows
 
     @staticmethod
@@ -1810,7 +1808,7 @@ class InternalAppBmaoSearchRunner:
         row_ids_1d = torch.arange(n1, device=device, dtype=torch.long)
         row_valid = row_ids_1d.view(1, -1) < batch_n1.view(-1, 1)
         col_valid = torch.arange(n2, device=device, dtype=torch.long).view(1, -1) < batch_n2.view(-1, 1)
-        row_taken = (completed >= 0) | (completed == -1) | (~row_valid)
+        row_taken = (completed >= 0) | (~row_valid)
         selected_counts = ((completed >= 0) & row_valid).sum(dim=1).long()
 
         col_taken = torch.zeros((num_states, n2), dtype=torch.bool, device=device)
@@ -1820,16 +1818,16 @@ class InternalAppBmaoSearchRunner:
             col_taken[state_idx, completed[state_idx, row_idx].clamp(min=0, max=n2 - 1)] = True
         col_taken |= ~col_valid
 
-        remaining_rows = (~row_taken).sum(dim=1).long()
-        remaining_cols = (~col_taken).sum(dim=1).long()
-        full_sizes = selected_counts + torch.minimum(remaining_rows, remaining_cols)
+        full_sizes = batch_n1
         max_steps = int((full_sizes - selected_counts).clamp_min(0).max().item()) if full_sizes.numel() > 0 else 0
         if max_steps <= 0:
             completed = completed.masked_fill(row_valid & (completed < 0), -1)
             completed = completed.masked_fill(~row_valid, -1)
             return completed
 
-        work_scores = score_batch.clone()
+        # Keep every legal target available even for missing/nonfinite scores.
+        # Existing matches and padding are masked only after normalization.
+        work_scores = torch.nan_to_num(score_batch, nan=torch.finfo(score_batch.dtype).min)
         work_scores.masked_fill_(row_taken.unsqueeze(2), float('-inf'))
         work_scores.masked_fill_(col_taken.unsqueeze(1), float('-inf'))
         row_ids = row_ids_1d.view(1, -1).expand(num_states, -1)
@@ -2141,6 +2139,22 @@ class InternalAppBmaoSearchRunner:
         grouped = {}
         for context in contexts:
             grouped.setdefault(context.pair_index, []).append(context)
+        best_contexts = [
+            min(group, key=lambda ctx: (ctx.best_ub, ctx.candidate_index))
+            for group in grouped.values()
+        ]
+        mapped = [ctx for ctx in best_contexts if ctx.best_row_mapping_t is not None]
+        batch_maps = {}
+        if mapped and all(ctx.best_row_mapping_t.device == mapped[0].best_row_mapping_t.device
+                          for ctx in mapped):
+            # Transfer once, retaining the original tensors and output fields.
+            flat = torch.cat([ctx.best_row_mapping_t[:ctx.n1].detach()
+                              for ctx in mapped]).cpu().tolist()
+            offset = 0
+            for ctx in mapped:
+                count = min(ctx.n1, ctx.best_row_mapping_t.numel())
+                batch_maps[id(ctx)] = flat[offset:offset + count]
+                offset += count
         pair_results = []
         for pair_index, pair_contexts in sorted(grouped.items(), key=lambda item: item[0]):
             best_context = min(pair_contexts, key=lambda ctx: (ctx.best_ub, ctx.candidate_index))
@@ -2152,14 +2166,23 @@ class InternalAppBmaoSearchRunner:
                     for idx in ctx.selection_metrics.get('source_candidate_indices', [ctx.candidate_index])
                 }
             )
-            if best_context.best_row_mapping_t is not None:
+            exported_map = batch_maps.get(id(best_context))
+            if exported_map is not None:
+                best_matching_pairs = [[row, int(col)] for row, col in enumerate(exported_map)
+                                       if 0 <= col < best_context.n2]
+            elif best_context.best_row_mapping_t is not None:
                 best_matching_pairs = self._matching_pairs_from_row_mapping(best_context.best_row_mapping_t, best_context.n1, best_context.n2)
             elif best_context.best_matching_tensor is not None:
                 best_matching_pairs = self._matching_pairs_from_tensor(best_context.best_matching_tensor)
             else:
                 best_matching_pairs = best_context.best_matching_pairs
             best_row_mapping = None
-            if best_context.best_row_mapping_t is not None:
+            if exported_map is not None:
+                best_row_mapping = [
+                    None if col < 0 or col >= best_context.n2 else int(col)
+                    for col in exported_map
+                ]
+            elif best_context.best_row_mapping_t is not None:
                 best_row_mapping = [
                     (None if int(col) < 0 or int(col) >= int(best_context.n2) else int(col))
                     for col in best_context.best_row_mapping_t[:best_context.n1].detach().cpu().tolist()

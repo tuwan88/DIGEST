@@ -165,7 +165,7 @@ class DenseCrossGraphTransformer(nn.Module):
         flat_delta = xcat_delta[mcat]
         flat_batch = bid[mcat]
         flat_delta = self.node_norm(flat_delta, flat_batch)
-        xcat_norm = xcat_delta.new_zeros(xcat_delta.shape)
+        xcat_norm = flat_delta.new_zeros(xcat_delta.shape)
         xcat_norm[mcat] = flat_delta
         x1_norm = xcat_norm[:, :n1, :]
         x2_norm = xcat_norm[:, n1:, :]
@@ -225,9 +225,9 @@ class DenseCrossGraphTransformer(nn.Module):
         msg1_e = (row_alpha.unsqueeze(-1) * (edge_gate * edge_val + v2_e)).reshape(-1, self.hidden_dim)
         msg2_e = (col_alpha.unsqueeze(-1) * (edge_gate * edge_val + v1_e)).reshape(-1, self.hidden_dim)
 
-        msg1_flat = x1.new_zeros((bsz * n1, self.hidden_dim))
+        msg1_flat = msg1_e.new_zeros((bsz * n1, self.hidden_dim))
         msg1_flat.index_add_(0, row_group, msg1_e)
-        msg2_flat = x2.new_zeros((bsz * n2, self.hidden_dim))
+        msg2_flat = msg2_e.new_zeros((bsz * n2, self.hidden_dim))
         msg2_flat.index_add_(0, col_group, msg2_e)
         msg1 = msg1_flat.view(bsz, n1, self.hidden_dim)
         msg2 = msg2_flat.view(bsz, n2, self.hidden_dim)
@@ -251,9 +251,10 @@ class DenseCrossGraphTransformer(nn.Module):
         else:
             edge_new = edge_e + edge_delta
         if bool(getattr(self, "diagnostic_disable_inactive_edge_carry", False)):
-            edge_pair_new = edge.new_zeros(edge.shape)
+            edge_pair_new = edge_new.new_zeros(edge.shape)
         else:
-            edge_pair_new = edge.clone()
+            # GraphNorm can promote autocast values to FP32.
+            edge_pair_new = edge.to(dtype=edge_new.dtype, copy=True)
         edge_pair_new[b_idx, i_idx, j_idx] = edge_new
         edge_pair_new = edge_pair_new * pair_mask.unsqueeze(-1).to(edge_pair_new.dtype)
         return x1_new, x2_new, edge_pair_new

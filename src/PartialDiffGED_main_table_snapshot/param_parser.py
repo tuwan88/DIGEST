@@ -304,7 +304,7 @@ def parameter_parser():
         dest="v9_candidate_cap",
         type=int,
         default=8,
-        help="Per-row candidate column cap q used by gpu_refine before adding the delete action.",
+        help="Per-row real-target candidate column cap q used by gpu_refine.",
     )
     add_arg(
         "--gpu-max-search-depth",

@@ -27,6 +27,8 @@ from app_bmao_internal_search import InternalAppBmaoSearchRunner
 from diffusion_schedulers import CategoricalDiffusion, InferenceSchedule
 from layers import ScalarEmbeddingSine, timestep_embedding
 from layers_lightgt import DenseCrossGraphTransformer
+from pair_orientation import (smaller_first_item, restore_raw_pair_direction,
+                              restore_refine_result_direction)
 from utils import load_all_graphs, load_ged_map, load_labels, load_pair_manifest, resolve_dataset_root
 
 
@@ -56,7 +58,7 @@ class TestSizeBucketedBatchSampler:
             n2 = int(self.dataset.trainer.delta_graphs[id_1][id_2]["n"])
         else:
             n2 = int(self.dataset.trainer.gn[id_2])
-        return n1, n2
+        return min(n1, n2), max(n1, n2)
 
     def _pair_sort_key(self, pair_spec):
         n1, n2 = self._pair_size(pair_spec)
@@ -418,8 +420,9 @@ class DenseLightGTDiffMatchDenseIO(torch.nn.Module):
             return x1, x2
 
         flat_norm = graph_norm(flat_x, flat_batch)
-        out1 = x1.new_zeros(x1.shape)
-        out2 = x2.new_zeros(x2.shape)
+        # GraphNorm can promote autocast inputs to its parameter dtype.
+        out1 = flat_norm.new_zeros(x1.shape)
+        out2 = flat_norm.new_zeros(x2.shape)
         left_count = int(mask1.sum().item())
         out1[mask1] = flat_norm[:left_count]
         out2[mask2] = flat_norm[left_count:]
@@ -789,6 +792,9 @@ class GpuRefineOverlapPostprocessor:
         )
         chunk_wall_s = time.perf_counter() - chunk_run_start
         visible_time_s = time.perf_counter() - visible_start
+        for item in chunk_results:
+            candidate = chunk_pairs[int(item["pair_index"])]
+            item["pair_swapped"] = bool(candidate.get("pair_swapped", False))
         pair_start = int(chunk["pair_start"])
         if pair_start != 0:
             for item in chunk_results:
@@ -1456,6 +1462,11 @@ class TrainerDense(object):
         return degree.to(dtype=torch.float), labels.to(dtype=torch.long)
 
     def pack_dense_graph_pair(self, pair):
+        # Full-matching refinement uses the smaller graph as its source.
+        # This invariant needs no new CLI argument or model parameter.
+        return smaller_first_item(self._pack_dense_graph_pair_original(pair))
+
+    def _pack_dense_graph_pair_original(self, pair):
         pair_type, id_1, id_2 = pair[:3]
         if pair_type == 2:
             gt_ged = float(pair[3])
@@ -1545,6 +1556,7 @@ class TrainerDense(object):
         }
 
     def dense_collate(self, items):
+        items = [smaller_first_item(item) for item in items]
         batch_size = len(items)
         feat_dim = items[0]["x1"].shape[1]
         pad_n1 = max(int(item["n1"].item()) for item in items)
@@ -1568,6 +1580,7 @@ class TrainerDense(object):
             "n2": torch.zeros((batch_size,), dtype=torch.long),
             "pair": torch.zeros((batch_size, 2), dtype=torch.long),
             "pair_gid": torch.zeros((batch_size, 2), dtype=torch.long),
+            "pair_swapped": torch.zeros((batch_size,), dtype=torch.bool),
             "mask1": torch.zeros((batch_size, pad_n1), dtype=torch.bool),
             "mask2": torch.zeros((batch_size, pad_n2), dtype=torch.bool),
         }
@@ -1597,6 +1610,7 @@ class TrainerDense(object):
             batch["n2"][batch_idx] = item["n2"]
             batch["pair"][batch_idx] = item["pair"]
             batch["pair_gid"][batch_idx] = item["pair_gid"]
+            batch["pair_swapped"][batch_idx] = item["pair_swapped"]
             batch["mask1"][batch_idx, :n1] = True
             batch["mask2"][batch_idx, :n2] = True
 
@@ -2348,7 +2362,18 @@ class TrainerDense(object):
         # edges whose matched right endpoints are adjacent. The number of preserved
         # matched edges is the same whether counted on the left graph or the right
         # graph, so one mapped adjacency is enough to derive both delete and insert.
-        mapped_right_adj = torch.bmm(torch.bmm(matchings_f, expanded_batch["ged_adj2"]), matchings_f.transpose(1, 2)) > 0.5
+        if matchings.shape[2] > 0:
+            row_matched = matchings.any(dim=2)
+            columns = matchings.to(torch.int32).argmax(dim=2)
+            pair_idx = torch.arange(matchings.shape[0], device=matchings.device)
+            mapped_right_adj = (
+                expanded_batch["ged_adj2"][
+                    pair_idx[:, None, None], columns[:, :, None], columns[:, None, :]
+                ] > 0.5
+            )
+            mapped_right_adj &= row_matched[:, :, None] & row_matched[:, None, :]
+        else:
+            mapped_right_adj = torch.bmm(torch.bmm(matchings_f, expanded_batch["ged_adj2"]), matchings_f.transpose(1, 2)) > 0.5
         preserved_edge_count = (left_upper & mapped_right_adj).sum(dim=(1, 2)).to(dtype=torch.float)
 
         edge_delete_cost = left_edge_count - preserved_edge_count
@@ -2434,6 +2459,7 @@ class TrainerDense(object):
         status="success",
         timeout=False,
         extra_fields=None,
+        pair_swapped=False,
     ):
         produced_ged = float(produced_ged)
         reference_value = None if reference_ged is None else float(reference_ged)
@@ -2467,7 +2493,7 @@ class TrainerDense(object):
         }
         if extra_fields:
             record.update(extra_fields)
-        return record
+        return restore_raw_pair_direction(record, pair_swapped)
 
     @staticmethod
     def cal_pk(num, pre, gt):
@@ -2542,7 +2568,8 @@ class TrainerDense(object):
             with torch.no_grad():
                 with self._eval_autocast_context():
                     pred_logits = self.model(expanded_batch, mapping_t, step_t.float())
-            pred_probs = torch.sigmoid(pred_logits)
+            # Keep probability clamping and decoding in FP32 under autocast.
+            pred_probs = torch.sigmoid(pred_logits.float())
             pred_pair_probs = torch.stack([1.0 - pred_probs, pred_probs], dim=-1)
             mapping_t = self.categorical_posterior_dense(
                 target_t=t2,
@@ -2643,7 +2670,8 @@ class TrainerDense(object):
             with torch.no_grad():
                 with self._eval_autocast_context():
                     pred_logits = self.model(expanded_batch, mapping_t, step_t)
-            pred_probs = torch.sigmoid(pred_logits)
+            # Keep probability clamping and decoding in FP32 under autocast.
+            pred_probs = torch.sigmoid(pred_logits.float())
             raw_scores = torch.logit(pred_probs.clamp(1e-6, 1 - 1e-6))
             if str(getattr(self.args, "score_calibration_mode", "calibrated")) == "raw":
                 adjusted_scores = raw_scores
@@ -3024,6 +3052,7 @@ class TrainerDense(object):
                             {
                                 "pair": batch["pair"][item_idx].clone(),
                                 "pair_gid": batch["pair_gid"][item_idx].clone(),
+                                "pair_swapped": batch["pair_swapped"][item_idx].clone(),
                                 "x1": batch["x1"][item_idx, :n1].clone(),
                                 "x2": batch["x2"][item_idx, :n2].clone(),
                                 "adj1": batch["adj1"][item_idx, :n1, :n1].clone(),
@@ -3076,6 +3105,11 @@ class TrainerDense(object):
                 batch_outputs = outputs if isinstance(outputs, list) else [outputs]
                 pred_ged = torch.stack([torch.as_tensor(out[0], device=self.device, dtype=torch.float) for out in batch_outputs])
                 running_time = torch.tensor([float(out[2]) for out in batch_outputs], device=self.device, dtype=torch.float)
+            pair_swapped_values = batch["pair_swapped"].detach().cpu().tolist()
+            for item_idx, out in enumerate(batch_outputs):
+                candidate = out[4].get("all_candidates")
+                if candidate is not None:
+                    candidate["pair_swapped"] = bool(pair_swapped_values[item_idx])
             gt_values = batch["ged"].view(-1)
             current_batch_candidates = []
             if save_raw_pair_log:
@@ -3110,6 +3144,7 @@ class TrainerDense(object):
                     {
                         "pair_values": pair_values,
                         "pair_gid_values": pair_gid_values,
+                        "pair_swapped_values": pair_swapped_values,
                         "n1_values": n1_values,
                         "n2_values": n2_values,
                         "pred_ged_values": pred_ged_values,
@@ -3130,7 +3165,8 @@ class TrainerDense(object):
             time_sum += float(running_time.sum().item())
             pred_lt_gt_sum += float((pred_ged < gt_values).float().sum().item())
             acc_sum += float((pred_ged == gt_values).float().sum().item())
-            graph_ids.extend(int(v) for v in batch["pair"][:, 0].detach().cpu().tolist())
+            original_queries = torch.where(batch["pair_swapped"], batch["pair"][:, 1], batch["pair"][:, 0])
+            graph_ids.extend(int(v) for v in original_queries.detach().cpu().tolist())
             pred_values.extend(float(v) for v in pred_ged.detach().cpu().tolist())
             gt_targets.extend(float(v) for v in gt_values.detach().cpu().tolist())
             if getattr(self.args, "save_test_k_candidates", False) or getattr(self.args, "app_bmao_postprocess_enable", False):
@@ -3489,6 +3525,7 @@ class TrainerDense(object):
                             config_name=raw_batch["config_name"],
                             budget_parameters=raw_batch["budget_parameters"],
                             matching=matched_pairs,
+                            pair_swapped=raw_batch["pair_swapped_values"][item_idx],
                         )
                         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             result_payload["raw_pair_log"] = str(raw_pair_path)
@@ -4186,6 +4223,7 @@ class TrainerDense(object):
             "solver_backend": solver_config["backend"],
             "solver_paradigm": solver_config["paradigm"],
             "solver_lower_bound": solver_config["lower_bound"],
+            "pair_swapped": bool(candidate_pair.get("pair_swapped", False)),
         }
 
     def run_app_bmao_postprocess(self, candidate_pairs, testing_graph_set, top_k_approach, test_k, pair_index_offset=0, finalize=True):
@@ -4288,6 +4326,10 @@ class TrainerDense(object):
                         "chunk_wall_time_s": float(chunk_wall_s),
                         "profile": runner.last_profile_report,
                     })
+                # runner.run returns indices relative to this refine microbatch.
+                if chunk_start:
+                    for item in chunk_results:
+                        item["pair_index"] = int(item["pair_index"]) + chunk_start
                 pair_results.extend(chunk_results)
                 completed += len(chunk_pairs)
                 if total > 0:
@@ -4418,6 +4460,9 @@ class TrainerDense(object):
                     "aggregate_metadata": aggregate_metadata,
                 }
 
+        for item in pair_results:
+            candidate = candidate_pairs[int(item["pair_index"])]
+            item["pair_swapped"] = bool(candidate.get("pair_swapped", False))
         if pair_index_offset != 0:
             for item in pair_results:
                 item["pair_index"] = int(item["pair_index"] + pair_index_offset)
@@ -4587,6 +4632,8 @@ class TrainerDense(object):
         search_backend,
         profiling_report=None,
     ):
+        for item in pair_results:
+            restore_refine_result_direction(item)
         pair_results.sort(key=lambda item: item["pair_index"])
         num_pairs = max(len(pair_results), 1)
         avg_baseline = sum(item["baseline_candidate_ged"] for item in pair_results) / num_pairs
@@ -4709,6 +4756,7 @@ class TrainerDense(object):
                         budget_parameters=budget_parameters,
                         matching=matching,
                         extra_fields={
+                            "input_pair_swapped": bool(item.get("input_pair_swapped", False)),
                             "before_refine_ged": float(item["baseline_candidate_ged"]),
                             "after_refine_ged": float(item["refined_ged"]),
                             "anchor_count": item.get("best_anchor_count"),
